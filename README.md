@@ -14,7 +14,9 @@
   - `unsupported_version`：未知协议版本（按规则降级接受，见下文）；
   - `duplicate`：重复上报（采集层与存储层双重去重）；
   - `capacity_full`：已确认存储或断链暂存区达到容量上限；
-  - `orphan_pending_parent`：父跨度未到达，跨度被暂存（非错误，可后续补齐）。
+  - `orphan_pending_parent`：父跨度未到达，跨度被暂存（非错误，可后续补齐）；
+  - `late_beyond_grace`：超出窗口宽限期或归属窗口已淘汰（窗口导出层处置）；
+  - `future_window`：跨度起点落在当前窗口之后（窗口导出层处置）。
 
 ## 上下文解析与版本兼容规则（span.ParseContext）
 
@@ -46,6 +48,42 @@
 - 以 `traceID/spanID` 去重，重复或迟到上报不重复计数；只统计采样保留的跨度。
 - `Snapshot()` 在锁内拷贝，并发写入下对外快照一致；聚合结果与到达顺序无关。
 
+## 滚动时间窗口导出（pipeline.WindowExporter）
+
+在聚合之上按固定时间窗口滚动产出对外统计视图，供报表按窗口消费。
+配置 `Config.Window`（`Size<=0` 表示不启用）：
+
+- `Size`：窗口长度。所有窗口按 `Size` 对齐 Unix 纪元，跨度按 **`Start`（而非到达时间）**
+  归属窗口，窗口口径不随跨度到达先后改变。
+- `Retain`：保留的历史窗口数（含当前窗口）。超出即整体淘汰最旧窗口，
+  窗口内的统计与去重集合一并释放，辅助结构占用有界、不随历史追踪数增长。
+- `Grace`：迟到宽限期。窗口结束后 `Grace` 内的迟到跨度**并入其本应归属的窗口**；
+  超出宽限期、归属窗口已淘汰、或起点落在当前窗口之后的跨度：
+  **不静默丢弃、不悄悄计入当前窗口**，而是记为 `late_beyond_grace` / `future_window`，
+  可通过 `RejectionCounts`、`WindowMetrics()`（重复/超宽限/未来窗口计数）与
+  `WindowLateLog()`（有界处置日志，含判定依据）核对。
+
+查询与一致性：
+
+- `WindowView(at)`：取包含 `at` 的窗口（起点自动对齐）的服务维度与追踪维度结果；
+  `PublishedWindows()`：只返回已封板（窗口结束且宽限期已过、结果不再变化）的窗口。
+- 每个窗口自带 `traceID/spanID` 去重集合：乱序、断链补齐、翻窗、重启后的
+  重复上报都不会重复计数。
+- 查询持读锁拷贝，返回完整一致视图；淘汰只发生在写入路径，查询不阻塞写入，
+  也不会读到更新了一半的窗口。
+
+跨重启与跨版本：
+
+- 窗口状态（含各窗口去重集合、处置计数与日志）随 `Snapshot()` 以
+  **临时文件 + rename** 原子落盘（`windows.json`，带格式版本号），`Restore()` 一并恢复；
+  恢复全部完成前不应对外查询，中间状态不可见。
+- 重启后已发布窗口结果与窗口边界不丢失、不重复：同一批跨度重新上报仍被去重，
+  窗口结果不翻倍。
+- 跨版本/损坏读取的降级规则（每条都写入 `WindowNotes()`，可核对，绝不猜测归属）：
+  版本号未知 → 整份快照忽略、从空窗口启动；单条窗口缺 `seen/services/traces`
+  → 跳过该条；窗口数超过 `Retain` → 只恢复最近 `Retain` 个；
+  文件整体非法 → 返回错误，不带猜测数据对外服务。
+
 ## 容量与持久化
 
 - `Config.MaxSpans`：已确认跨度容量上限，超限拒绝并计数（`RejectionCounts` 可观测）。
@@ -61,13 +99,16 @@ p := pipeline.New(pipeline.Config{
     MaxSpans: 10000, MaxOrphans: 1000,
     Ratio: 0.5, AttrRules: map[string]string{"tier": "critical"},
     Dir: "/var/lib/tracing",
+    Window: pipeline.WindowConfig{Size: time.Minute, Retain: 60, Grace: 30 * time.Second},
 })
 _ = p.Restore()
 rej := p.Submit(map[string]string{"traceparent": "00-<tid>-<sid>-01"},
-    span.Span{Service: "checkout", Duration: 120 * time.Millisecond})
+    span.Span{Service: "checkout", Start: time.Now(), Duration: 120 * time.Millisecond})
 // rej == nil 表示已确认；否则 rej.Reason 给出判定依据。
-stats := p.Stats()          // 服务维度一致快照
-_ = p.Snapshot()            // 优雅退出前落盘
+stats := p.Stats()               // 服务维度一致快照
+view, _ := p.WindowView(at)      // 指定窗口的服务/追踪维度结果
+pub := p.PublishedWindows()      // 已封板窗口（报表消费口径）
+_ = p.Snapshot()                 // 优雅退出前落盘
 ```
 
 ## 验证方法
@@ -79,4 +120,6 @@ CGO_ENABLED=1 go test -race ./...  # 并发一致性（竞态检测）
 ```
 
 测试覆盖：乱序与级联补齐、重复上报去重、上下文非法/未知版本降级、
-采样粘性与配置变更、容量边界拒绝、重启恢复不丢不重、并发写入一致性。
+采样粘性与配置变更、容量边界拒绝、重启恢复不丢不重、并发写入一致性；
+窗口层另覆盖：乱序与迟到数据、宽限期边界、重复上报、窗口滚动与淘汰、
+并发查询与写入、重启前后窗口结果一致、跨版本/损坏快照降级。

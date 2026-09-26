@@ -27,6 +27,8 @@ const (
 	ReasonDuplicate        RejectionReason = "duplicate"
 	ReasonCapacityFull     RejectionReason = "capacity_full"
 	ReasonOrphan           RejectionReason = "orphan_pending_parent"
+	ReasonLateExpired      RejectionReason = "late_beyond_grace"
+	ReasonFutureWindow     RejectionReason = "future_window"
 )
 
 // Rejection 记录一次拒绝及其判定依据。

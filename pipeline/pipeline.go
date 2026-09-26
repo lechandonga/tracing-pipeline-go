@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"sync"
+	"time"
 
 	"github.com/lechandonga/tracing-pipeline-go/span"
 )
@@ -13,6 +14,7 @@ type Config struct {
 	Ratio      float64           // 按比例采样率 [0,1]
 	AttrRules  map[string]string // 按属性采样规则
 	Dir        string            // 快照目录，空表示不持久化
+	Window     WindowConfig      // 滚动时间窗口导出，Size<=0 表示不启用
 }
 
 // Pipeline 串联上下文解析、采集、采样与聚合。
@@ -22,6 +24,7 @@ type Pipeline struct {
 	sam *Sampler
 	st  *Store
 	agg *Aggregator
+	win *WindowExporter
 
 	mu         sync.Mutex
 	rejections []span.Rejection // 有界判定日志
@@ -32,7 +35,7 @@ type Pipeline struct {
 const maxRejectionLog = 1000
 
 func New(cfg Config) *Pipeline {
-	return &Pipeline{
+	p := &Pipeline{
 		cfg:    cfg,
 		ing:    NewIngester(cfg.MaxOrphans),
 		sam:    NewSampler(cfg.Ratio, cfg.AttrRules),
@@ -40,6 +43,10 @@ func New(cfg Config) *Pipeline {
 		agg:    NewAggregator(),
 		counts: map[span.RejectionReason]int64{},
 	}
+	if cfg.Window.valid() {
+		p.win = NewWindowExporter(cfg.Window)
+	}
+	return p
 }
 
 // Submit 接收一条原始跨度记录。
@@ -71,7 +78,12 @@ func (p *Pipeline) Submit(raw map[string]string, sp span.Span) *span.Rejection {
 			last = rej
 			continue
 		}
-		p.agg.Observe(sp)
+		if p.agg.Observe(sp) && p.win != nil {
+			if rej := p.win.Observe(sp); rej != nil {
+				p.record(*rej)
+				last = rej
+			}
+		}
 	}
 	return last
 }
@@ -119,6 +131,46 @@ func (p *Pipeline) TraceStats(traceID string) (Stats, bool) { return p.agg.Trace
 // PendingOrphans 返回断链暂存跨度数。
 func (p *Pipeline) PendingOrphans() int { return p.ing.PendingOrphans() }
 
+// WindowView 查询包含指定时刻的滚动窗口（起点自动对齐）的服务与追踪维度结果。
+func (p *Pipeline) WindowView(at time.Time) (WindowView, bool) {
+	if p.win == nil {
+		return WindowView{}, false
+	}
+	return p.win.View(at)
+}
+
+// PublishedWindows 返回已封板窗口（结束且宽限期已过），按起点升序。
+func (p *Pipeline) PublishedWindows() []WindowView {
+	if p.win == nil {
+		return nil
+	}
+	return p.win.Published()
+}
+
+// WindowMetrics 返回窗口导出器的处置计数：重复、超宽限期、未来窗口。
+func (p *Pipeline) WindowMetrics() (dups, expired, future int64) {
+	if p.win == nil {
+		return 0, 0, 0
+	}
+	return p.win.Metrics()
+}
+
+// WindowLateLog 返回窗口侧最近的越界处置记录。
+func (p *Pipeline) WindowLateLog() []LateRecord {
+	if p.win == nil {
+		return nil
+	}
+	return p.win.LateLog()
+}
+
+// WindowNotes 返回窗口快照恢复时的降级依据。
+func (p *Pipeline) WindowNotes() []string {
+	if p.win == nil {
+		return nil
+	}
+	return p.win.Notes()
+}
+
 // StoredSpans 返回已确认跨度数。
 func (p *Pipeline) StoredSpans() int { return p.st.Len() }
 
@@ -132,13 +184,25 @@ func (p *Pipeline) Snapshot() error {
 	if err := p.st.Snapshot(); err != nil {
 		return err
 	}
-	return p.agg.Save(p.cfg.Dir)
+	if err := p.agg.Save(p.cfg.Dir); err != nil {
+		return err
+	}
+	if p.win != nil {
+		return p.win.Save(p.cfg.Dir)
+	}
+	return nil
 }
 
-// Restore 从快照恢复；恢复完成前不应调用 Submit，恢复中的中间状态不对外可见。
+// Restore 从快照恢复；恢复完成前不应调用 Submit/查询，恢复中的中间状态不对外可见。
 func (p *Pipeline) Restore() error {
 	if err := p.st.Restore(); err != nil {
 		return err
 	}
-	return p.agg.Load(p.cfg.Dir)
+	if err := p.agg.Load(p.cfg.Dir); err != nil {
+		return err
+	}
+	if p.win != nil {
+		return p.win.Load(p.cfg.Dir)
+	}
+	return nil
 }
