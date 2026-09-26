@@ -46,6 +46,51 @@
 - 以 `traceID/spanID` 去重，重复或迟到上报不重复计数；只统计采样保留的跨度。
 - `Snapshot()` 在锁内拷贝，并发写入下对外快照一致；聚合结果与到达顺序无关。
 
+## 滚动时间窗口导出（pipeline.WindowExporter）
+
+在累计聚合之上，按固定时间窗口滚动产出**服务维度与追踪维度**的统计视图，
+供报表按窗口消费。配置项 `Config.Window`（`WindowConfig`）：
+
+- `Size`：窗口长度。跨度按 `Start` 向下对齐到 `Size` 整数倍归属窗口，
+  **口径不随到达先后改变**；`Size<=0` 表示禁用窗口导出。
+- `Retain`：保留的窗口个数（含当前窗口），超出即淘汰最旧窗口。
+- `Grace`：迟到宽限期（从窗口结束起算）。窗口在 `End+Grace` 前保持可并入，
+  之后关闭（`WindowView.Closed`），关闭后仍在保留期内可查。
+
+迟到与重复数据的处置规则（均可通过 `WindowDisposals()` 核对计数与有界日志）：
+
+- 宽限期内的迟到跨度并入其**本应归属**的窗口，不进当前窗口。
+- 超出宽限期（窗口已关闭）→ 处置为 `too_late`，不计入任何窗口。
+- 归属窗口已按 `Retain` 淘汰 → 处置为 `window_evicted`，不重建窗口。
+- 重复上报（含补齐释放、翻窗后、重启后的重放）→ 处置为 `duplicate`，
+  窗口内去重集合保证不二次计数；管道层还有 Ingester/Store/Aggregator 三重去重。
+- 跨度起点晚于当前时钟（时钟倒挂）→ 处置为 `clock_rewind`，不猜测归属；
+  起点缺失（零值）的跨度按到达时刻计入当前窗口。
+
+有界性与并发：
+
+- 历史窗口按 `Retain` 淘汰，窗口内去重集合随窗口一起释放；
+  处置日志（1000 条）与降级记录（100 条）均有上限，不随历史追踪数增长。
+- 窗口切换、淘汰与查询共用一把锁，查询返回**拷贝**：
+  对外永远是完整一致的视图，不存在只更新一半的窗口，查询不阻塞写入。
+
+跨重启与跨版本：
+
+- `Snapshot()` 把窗口状态（窗口边界、服务/追踪统计、窗口内去重集合、处置计数）
+  随其余状态一起原子落盘（`windows.json`，临时文件 + rename）。
+- `Restore()` 全部完成后窗口查询才放行（`ready` 门控），恢复中的中间状态不可见；
+  快照后未落盘的写入在崩溃重启后不出现，已发布窗口结果与边界不丢失。
+- 重启后同一批跨度重新上报不会让窗口结果翻倍（去重集合已持久化）。
+- 快照带格式版本号，降级规则明确且留痕（`WindowDegradations()`）：
+  文件缺失 → 空状态正常启动；JSON 非法 → 返回错误；版本缺失 → 按 v1 解读并记录；
+  版本未知 → 整份跳过不猜测；单条窗口未对齐/统计非法 → 跳过该条；
+  未知字段 → 忽略并记录字段名（向前兼容）。
+
+查询接口：`WindowQuery(start)`（起点自动对齐，返回 `WindowView`）、
+`Windows()`（保留中窗口元数据）、`WindowDisposals()`、`WindowDegradations()`。
+测试可经 `Config.Clock` 注入时钟。
+
+
 ## 容量与持久化
 
 - `Config.MaxSpans`：已确认跨度容量上限，超限拒绝并计数（`RejectionCounts` 可观测）。
@@ -61,12 +106,15 @@ p := pipeline.New(pipeline.Config{
     MaxSpans: 10000, MaxOrphans: 1000,
     Ratio: 0.5, AttrRules: map[string]string{"tier": "critical"},
     Dir: "/var/lib/tracing",
+    Window: pipeline.WindowConfig{Size: time.Minute, Retain: 60, Grace: 30 * time.Second},
 })
 _ = p.Restore()
 rej := p.Submit(map[string]string{"traceparent": "00-<tid>-<sid>-01"},
-    span.Span{Service: "checkout", Duration: 120 * time.Millisecond})
+    span.Span{Service: "checkout", Start: time.Now(), Duration: 120 * time.Millisecond})
 // rej == nil 表示已确认；否则 rej.Reason 给出判定依据。
 stats := p.Stats()          // 服务维度一致快照
+view, ok := p.WindowQuery(time.Now()) // 当前窗口的服务/追踪维度视图
+_, _ = view, ok
 _ = p.Snapshot()            // 优雅退出前落盘
 ```
 
@@ -79,4 +127,7 @@ CGO_ENABLED=1 go test -race ./...  # 并发一致性（竞态检测）
 ```
 
 测试覆盖：乱序与级联补齐、重复上报去重、上下文非法/未知版本降级、
-采样粘性与配置变更、容量边界拒绝、重启恢复不丢不重、并发写入一致性。
+采样粘性与配置变更、容量边界拒绝、重启恢复不丢不重、并发写入一致性；
+滚动窗口的归属口径与乱序/迟到合并、宽限期边界、重复与翻窗重放不二次计数、
+窗口滚动与保留淘汰、并发查询一致性、重启前后窗口结果一致与恢复门控、
+快照版本/字段缺失与非法时的降级留痕。
