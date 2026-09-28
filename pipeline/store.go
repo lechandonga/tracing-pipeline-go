@@ -112,6 +112,9 @@ func (s *Store) Snapshot() error {
 }
 
 // Restore 从快照恢复；无快照时从空状态开始。
+//
+// 全程在本地构建，最后一次性替换并合并拒绝计数：恢复完成前对外查询不到
+// 只加载了一半的中间状态；快照超出容量的部分按最旧顺序截断（容量边界不放宽）。
 func (s *Store) Restore() error {
 	if s.dir == "" {
 		return nil
@@ -127,14 +130,16 @@ func (s *Store) Restore() error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return fmt.Errorf("快照损坏: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	spans := make(map[string]span.Span, len(snap.Spans))
 	for _, sp := range snap.Spans {
-		if len(s.spans) >= s.maxSpans {
+		if len(spans) >= s.maxSpans {
 			break
 		}
-		s.spans[keyOf(sp)] = sp
+		spans[keyOf(sp)] = sp
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spans = spans // 原子替换，不存在逐条加载的中间状态
 	for k, v := range snap.Rejected {
 		s.rejected[k] += v
 	}

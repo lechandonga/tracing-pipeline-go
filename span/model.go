@@ -22,13 +22,14 @@ type Span struct {
 type RejectionReason string
 
 const (
-	ReasonMalformedContext RejectionReason = "malformed_context"
-	ReasonUnsupportedVer   RejectionReason = "unsupported_version"
-	ReasonDuplicate        RejectionReason = "duplicate"
-	ReasonCapacityFull     RejectionReason = "capacity_full"
-	ReasonOrphan           RejectionReason = "orphan_pending_parent"
-	ReasonLateExpired      RejectionReason = "late_beyond_grace"
-	ReasonFutureWindow     RejectionReason = "future_window"
+	ReasonMalformedContext   RejectionReason = "malformed_context"
+	ReasonUnsupportedVer     RejectionReason = "unsupported_version"
+	ReasonDuplicate          RejectionReason = "duplicate"
+	ReasonCapacityFull       RejectionReason = "capacity_full"
+	ReasonOrphan             RejectionReason = "orphan_pending_parent"
+	ReasonLateExpired        RejectionReason = "late_beyond_grace"
+	ReasonFutureWindow       RejectionReason = "future_window"
+	ReasonRecoveryInProgress RejectionReason = "recovery_in_progress"
 )
 
 // Rejection 记录一次拒绝及其判定依据。

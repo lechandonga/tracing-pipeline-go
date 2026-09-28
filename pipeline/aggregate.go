@@ -24,12 +24,14 @@ type Stats struct {
 //  1. 以 traceID/spanID 去重，重复或迟到上报不得重复计数。
 //  2. 聚合只接受采样结论为保留的跨度，口径与到达顺序无关。
 //  3. Snapshot 在锁内拷贝，对外快照一致，不受并发写入影响。
-//  4. Save/Load 保证重启后已确认聚合不丢失、不重复。
+//  4. Save/Load 保证重启后已确认聚合不丢失、不重复；Load 在本地构建后一次性替换，
+//     恢复中间状态不对外可见，非法统计项按规则跳过并记录于 Notes。
 type Aggregator struct {
 	mu        sync.Mutex
 	seen      map[string]bool
 	byService map[string]*Stats
 	byTrace   map[string]*Stats
+	notes     []string
 }
 
 func NewAggregator() *Aggregator {
@@ -73,6 +75,9 @@ func (a *Aggregator) Snapshot() map[string]Stats {
 	defer a.mu.Unlock()
 	out := make(map[string]Stats, len(a.byService))
 	for k, v := range a.byService {
+		if v == nil {
+			continue
+		}
 		out[k] = *v
 	}
 	return out
@@ -83,7 +88,7 @@ func (a *Aggregator) TraceStats(traceID string) (Stats, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	st, ok := a.byTrace[traceID]
-	if !ok {
+	if !ok || st == nil {
 		return Stats{}, false
 	}
 	return *st, true
@@ -124,7 +129,18 @@ func (a *Aggregator) Save(dir string) error {
 	return os.Rename(tmp, filepath.Join(dir, "aggregate.json"))
 }
 
+// Notes 返回从聚合快照恢复时的降级依据（拷贝）。
+func (a *Aggregator) Notes() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.notes...)
+}
+
 // Load 从快照恢复聚合状态；无快照时从空状态开始。
+//
+// 恢复全程在本地构建、最后一次性替换，对外没有逐条加载的中间状态。
+// 单个统计项为空(null)、含负计数、或错误数大于总数时：跳过该项并写入 Notes，
+// 其余聚合正常恢复、正常查询，绝不让非法值对外发布，也不带崩进程。
 func (a *Aggregator) Load(dir string) error {
 	if dir == "" {
 		return nil
@@ -140,16 +156,26 @@ func (a *Aggregator) Load(dir string) error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return fmt.Errorf("聚合快照损坏: %w", err)
 	}
+	seen := map[string]bool{}
+	for _, k := range snap.Seen {
+		seen[k] = true
+	}
+	notes := []string{}
+	services := make(map[string]*Stats, len(snap.ByService))
+	for k, v := range snap.ByService {
+		services[k] = v
+	}
+	traces := make(map[string]*Stats, len(snap.ByTrace))
+	for k, v := range snap.ByTrace {
+		traces[k] = v
+	}
+	sanitizeStats(services, "聚合快照 by_service", &notes)
+	sanitizeStats(traces, "聚合快照 by_trace", &notes)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, k := range snap.Seen {
-		a.seen[k] = true
-	}
-	for k, v := range snap.ByService {
-		a.byService[k] = v
-	}
-	for k, v := range snap.ByTrace {
-		a.byTrace[k] = v
-	}
+	a.seen = seen
+	a.byService = services
+	a.byTrace = traces
+	a.notes = append(a.notes, notes...)
 	return nil
 }

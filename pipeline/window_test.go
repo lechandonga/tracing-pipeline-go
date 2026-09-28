@@ -75,7 +75,7 @@ func TestWindowGraceBoundary(t *testing.T) {
 	if rej == nil || rej.Reason != span.ReasonLateExpired {
 		t.Fatalf("expected late_beyond_grace, got %+v", rej)
 	}
-	_, expired, _ := w.Metrics()
+	_, expired, _, _ := w.Metrics()
 	if expired != 1 {
 		t.Fatalf("expired=%d, want 1", expired)
 	}
@@ -95,7 +95,7 @@ func TestWindowFutureSpanRejected(t *testing.T) {
 	if rej == nil || rej.Reason != span.ReasonFutureWindow {
 		t.Fatalf("expected future_window, got %+v", rej)
 	}
-	_, _, future := w.Metrics()
+	_, _, future, _ := w.Metrics()
 	if future != 1 {
 		t.Fatalf("future=%d, want 1", future)
 	}
@@ -113,7 +113,7 @@ func TestWindowDuplicateNotDoubleCounted(t *testing.T) {
 	// 翻窗后再次重复上报（窗口仍保留）。
 	now = winBase.Add(70 * time.Second)
 	w.Observe(sp)
-	dups, _, _ := w.Metrics()
+	dups, _, _, _ := w.Metrics()
 	if dups != 2 {
 		t.Fatalf("dups=%d, want 2", dups)
 	}
@@ -195,7 +195,7 @@ func TestWindowConcurrentQueryAndWrite(t *testing.T) {
 			total += c.Count
 		}
 	}
-	dups, expired, future := w.Metrics()
+	dups, expired, future, _ := w.Metrics()
 	if got := total + dups + expired + future; got != 4*200 {
 		t.Fatalf("counted=%d dups=%d expired=%d future=%d, want sum=%d",
 			total, dups, expired, future, 4*200)
@@ -260,9 +260,26 @@ func TestWindowLoadDegradation(t *testing.T) {
 		t.Fatalf("unknown version should be ignored with note, windows=%d notes=%v",
 			len(w.Windows()), w.Notes())
 	}
-	// 单条缺 seen：跳过该条并留痕，其余正常恢复。
+	// v1 快照：必须带文件级 size_ns 才能确定边界；缺少时整份忽略并留痕，绝不猜测归属。
 	writeWindowsJSON(t, dir, map[string]any{
-		"version": windowFormatVersion,
+		"version": windowFormatV1,
+		"windows": []any{
+			map[string]any{"index": 0, "services": map[string]any{}, "traces": map[string]any{},
+				"seen": []any{}},
+		},
+	})
+	w1b := NewWindowExporter(cfg)
+	if err := w1b.Load(dir); err != nil {
+		t.Fatal(err)
+	}
+	if len(w1b.Windows()) != 0 {
+		t.Fatalf("v1 without size_ns must be fully ignored, got %d windows", len(w1b.Windows()))
+	}
+	// 单条缺 seen：跳过该条并留痕，其余正常恢复（v1 带 size_ns/grace_ns）。
+	writeWindowsJSON(t, dir, map[string]any{
+		"version":  windowFormatV1,
+		"size_ns":  int64(time.Minute),
+		"grace_ns": int64(30 * time.Second),
 		"windows": []any{
 			map[string]any{"index": 1, "services": map[string]any{}, "traces": map[string]any{}},
 			map[string]any{"index": 2, "services": map[string]any{}, "traces": map[string]any{},
