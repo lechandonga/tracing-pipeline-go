@@ -263,6 +263,7 @@ func TestWindowLoadDegradation(t *testing.T) {
 	// 单条缺 seen：跳过该条并留痕，其余正常恢复。
 	writeWindowsJSON(t, dir, map[string]any{
 		"version": windowFormatVersion,
+		"size_ns": int64(cfg.Size), "grace_ns": int64(cfg.Grace),
 		"windows": []any{
 			map[string]any{"index": 1, "services": map[string]any{}, "traces": map[string]any{}},
 			map[string]any{"index": 2, "services": map[string]any{}, "traces": map[string]any{},

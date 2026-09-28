@@ -217,9 +217,15 @@ func (w *WindowExporter) snapshotLocked(idx int64, win *window, now time.Time) W
 		Traces:   make(map[string]Stats, len(win.traces)),
 	}
 	for k, s := range win.services {
+		if s == nil {
+			continue // 防御：非法统计在恢复时已剔除，这里兜底保证查询不崩
+		}
 		v.Services[k] = *s
 	}
 	for k, s := range win.traces {
+		if s == nil {
+			continue
+		}
 		v.Traces[k] = *s
 	}
 	return v
@@ -256,8 +262,10 @@ type windowSnapshotFile struct {
 	Expired int64         `json:"expired"`
 	Future  int64         `json:"future"`
 	LateLog []LateRecord  `json:"late_log"`
-	SizeNs  int64         `json:"size_ns"`
-	GraceNs int64         `json:"grace_ns"`
+	// 指针形态用于区分“字段缺失”（nil，老版本/外来存档）与合法零值：
+	// 缺失即无法核对窗口边界，按降级规则拒收窗口，绝不猜测。
+	SizeNs  *int64 `json:"size_ns"`
+	GraceNs *int64 `json:"grace_ns"`
 }
 
 // windowEntry 是单个窗口的持久化形态。
@@ -274,10 +282,11 @@ func (w *WindowExporter) Save(dir string) error {
 		return nil
 	}
 	w.mu.RLock()
+	sizeNs, graceNs := int64(w.cfg.Size), int64(w.cfg.Grace)
 	snap := windowSnapshotFile{
 		Version: windowFormatVersion,
-		SizeNs:  int64(w.cfg.Size),
-		GraceNs: int64(w.cfg.Grace),
+		SizeNs:  &sizeNs,
+		GraceNs: &graceNs,
 		Windows: make([]windowEntry, 0, len(w.windows)),
 		Dups:    w.dups,
 		Expired: w.expired,
@@ -316,11 +325,17 @@ func (w *WindowExporter) Save(dir string) error {
 
 // Load 从快照恢复窗口状态；无快照时从空状态开始。
 //
-// 跨版本/损坏数据的降级规则（每条都写入 Notes，可核对，绝不猜测归属）：
+// 跨重启/跨版本/损坏数据的降级规则（每条都写入 Notes，可核对，绝不猜测归属）：
 //  1. 版本号未知（非 windowFormatVersion）→ 整份快照忽略，从空窗口启动；
-//  2. 单条窗口 index 非法、缺少 seen/services/traces → 跳过该条并记录；
-//  3. 窗口数超过 Retain → 只恢复最近 Retain 个，其余跳过并记录；
-//  4. 文件 JSON 整体非法 → 返回错误，调用方不应带着猜测数据对外服务。
+//  2. size_ns/grace_ns 字段缺失 → 无法核对窗口边界，拒收存档窗口（处置计数仍恢复）；
+//  3. 存档 size/grace 与当前配置不一致 → 为保证已发布窗口的边界与归属跟关机前
+//     完全一致，拒收存档窗口、从空窗口启动（处置计数仍恢复），绝不按新配置静默
+//     重新解释旧窗口 index；
+//  4. 单条窗口 index 非法、缺少 seen/services/traces → 跳过该条并记录；
+//  5. 单条统计值为空、含负数计数、错误数超过总数 → 跳过该条统计并记录，
+//     同窗口其余合法统计与其余窗口不受影响；
+//  6. 窗口数超过 Retain → 只恢复最近 Retain 个，其余跳过并记录；
+//  7. 文件 JSON 整体非法 → 返回错误，调用方不应带着猜测数据对外服务。
 func (w *WindowExporter) Load(dir string) error {
 	if dir == "" || !w.cfg.valid() {
 		return nil
@@ -346,13 +361,31 @@ func (w *WindowExporter) Load(dir string) error {
 		w.mu.Unlock()
 		return nil
 	}
-	entries := snap.Windows
-	if len(entries) > w.cfg.Retain {
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Index < entries[j].Index })
-		skipped := len(entries) - w.cfg.Retain
-		notes = append(notes, fmt.Sprintf("快照窗口数 %d 超过保留上限 %d，跳过最旧的 %d 个",
-			len(entries), w.cfg.Retain, skipped))
-		entries = entries[skipped:]
+	// 边界核对：存档的窗口长度/宽限期必须与当前配置一致，否则同一 index 会被
+	// 解释成另一段时间，已发布窗口的边界与归属被悄悄挪动。宁可拒收也不猜测。
+	restoreWindows := true
+	switch {
+	case snap.SizeNs == nil || snap.GraceNs == nil:
+		notes = append(notes, "窗口快照缺少 size_ns/grace_ns 字段，无法核对窗口边界，"+
+			"已拒收存档窗口、从空窗口启动（处置计数与日志仍恢复）")
+		restoreWindows = false
+	case *snap.SizeNs != int64(w.cfg.Size) || *snap.GraceNs != int64(w.cfg.Grace):
+		notes = append(notes, fmt.Sprintf(
+			"存档窗口配置 size=%s grace=%s 与当前配置 size=%s grace=%s 不一致："+
+				"为保证已发布窗口边界与归属不变，已拒收存档窗口、从空窗口启动（处置计数与日志仍恢复）",
+			time.Duration(*snap.SizeNs), time.Duration(*snap.GraceNs), w.cfg.Size, w.cfg.Grace))
+		restoreWindows = false
+	}
+	var entries []windowEntry
+	if restoreWindows {
+		entries = snap.Windows
+		if len(entries) > w.cfg.Retain {
+			sort.Slice(entries, func(i, j int) bool { return entries[i].Index < entries[j].Index })
+			skipped := len(entries) - w.cfg.Retain
+			notes = append(notes, fmt.Sprintf("快照窗口数 %d 超过保留上限 %d，跳过最旧的 %d 个",
+				len(entries), w.cfg.Retain, skipped))
+			entries = entries[skipped:]
+		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -365,6 +398,13 @@ func (w *WindowExporter) Load(dir string) error {
 		win := &window{services: e.Services, traces: e.Traces, seen: map[string]bool{}}
 		for _, k := range e.Seen {
 			win.seen[k] = true
+		}
+		// 统计值合法性校验：空值/负数/明显不合理的统计不对外发布，
+		// 只跳过该条统计，同窗口其余统计与其余窗口不受影响。
+		notes = append(notes, sanitizeWindowStats(e.Index, "services", win.services)...)
+		notes = append(notes, sanitizeWindowStats(e.Index, "traces", win.traces)...)
+		if _, dup := w.windows[e.Index]; dup {
+			notes = append(notes, fmt.Sprintf("窗口条目 index=%d 在快照中重复，以后一条为准", e.Index))
 		}
 		w.windows[e.Index] = win
 	}
@@ -379,4 +419,32 @@ func (w *WindowExporter) Load(dir string) error {
 	}
 	w.notes = append(w.notes, notes...)
 	return nil
+}
+
+// sanitizeWindowStats 剔除非法统计值并返回可核对的降级依据。
+func sanitizeWindowStats(idx int64, dim string, m map[string]*Stats) []string {
+	var notes []string
+	for k, s := range m {
+		if reason := invalidStat(s); reason != "" {
+			delete(m, k)
+			notes = append(notes, fmt.Sprintf(
+				"窗口 index=%d 的 %s[%q] 统计非法（%s），已跳过该条统计，其余结果不受影响",
+				idx, dim, k, reason))
+		}
+	}
+	return notes
+}
+
+// invalidStat 判定统计值是否明显不合法；返回空串表示合法。
+func invalidStat(s *Stats) string {
+	switch {
+	case s == nil:
+		return "统计值为空"
+	case s.Count < 0 || s.ErrorCnt < 0 || s.TotalDurNs < 0:
+		return fmt.Sprintf("含负数计数 count=%d error_count=%d total_dur_ns=%d",
+			s.Count, s.ErrorCnt, s.TotalDurNs)
+	case s.ErrorCnt > s.Count:
+		return fmt.Sprintf("错误数 %d 超过总数 %d", s.ErrorCnt, s.Count)
+	}
+	return ""
 }
